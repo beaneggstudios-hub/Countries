@@ -280,7 +280,8 @@ function handleAutocomplete(i) {
 }
 
 async function handleButton(i) {
-  const [kind, id] = i.customId.split(':');
+  const [rawKind, id] = i.customId.split(':');
+  const kind = rawKind.split('_')[0]; // 'ally_yes' -> 'ally', 'trade_no' -> 'trade', 'claim' -> 'claim'
   if (kind === 'claim') {
     const s = spawns.get(i.message.id);
     if (!s) return i.reply({ content: 'These envoys already left.', ...eph });
