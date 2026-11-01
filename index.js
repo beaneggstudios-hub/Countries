@@ -1,945 +1,774 @@
-'use strict';
-
-require('dotenv').config();
-
+/* =====================================================================
+   Empire Countries Bot  -  index.js
+   Env vars: TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID
+   Optional: SPAWN_MS (default 210000 = 3m30s), DATA_FILE (default ./data.json), PORT
+   ===================================================================== */
 const fs = require('fs');
-const path = require('path');
 const http = require('http');
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  EmbedBuilder,
+  Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
+  ButtonStyle, SlashCommandBuilder, MessageFlags, Events, AttachmentBuilder,
 } = require('discord.js');
 
-/* ------------------------------------------------------------------ */
-/* Configuration                                                       */
-/* ------------------------------------------------------------------ */
-
-const PREFIX = '?';
-const PERIOD_MS = 10 * 60 * 60 * 1000; // fixed 10-hour period
-const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000; // Discord timeout cap
-
-const TOKEN = process.env.TOKEN;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
-
-// Channel for message logs (deleted and edited messages).
-const MESSAGE_LOG_CHANNEL_ID = process.env.MESSAGE_LOG_CHANNEL_ID || '1564665733114236988';
-// Set LOG_ALL_MESSAGES=true to also log every message that is sent.
-const LOG_ALL_MESSAGES = String(process.env.LOG_ALL_MESSAGES || '').toLowerCase() === 'true';
-
-// Joke: this user gets roasted when they use ?help without holding a staff rank.
-const PEASANT_USER_ID = '1561335564341346335';
-
-// Persistent storage location. On hosts with an ephemeral filesystem
-// (for example Render without a disk), point DATA_DIR to a persistent disk.
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'limits.json');
-
-// Stored warnings (kept separately from the limit counters).
-const WARNINGS_FILE = path.join(DATA_DIR, 'warnings.json');
-
-// Staff ranks, highest first. Identified by configured role IDs, never by name.
-const RANK_DEFINITIONS = [
-  {
-    key: 'owner',
-    name: 'Owner',
-    level: 5,
-    roleId: process.env.OWNER_ROLE_ID,
-    limits: { ban: Infinity, kick: Infinity, mute: Infinity, warn: Infinity },
-  },
-  {
-    key: 'supervisor',
-    name: 'Supervisor',
-    level: 4,
-    roleId: process.env.SUPERVISOR_ROLE_ID,
-    limits: { ban: 5, kick: 7, mute: 12, warn: 15 },
-  },
-  {
-    key: 'senior_moderator',
-    name: 'Senior Moderator',
-    level: 3,
-    roleId: process.env.SENIOR_MODERATOR_ROLE_ID,
-    limits: { ban: 3, kick: 5, mute: 8, warn: 10 },
-  },
-  {
-    key: 'moderator',
-    name: 'Moderator',
-    level: 2,
-    roleId: process.env.MODERATOR_ROLE_ID,
-    limits: { ban: 2, kick: 3, mute: 5, warn: 6 },
-  },
-  {
-    key: 'trial_moderator',
-    name: 'Trial Moderator',
-    level: 1,
-    roleId: process.env.TRIAL_MODERATOR_ROLE_ID,
-    limits: { ban: 1, kick: 2, mute: 3, warn: 4 },
-  },
-];
-
-const RANKS = RANK_DEFINITIONS.filter((rank) => {
-  if (!rank.roleId) {
-    console.warn(`[config] Missing role ID for rank "${rank.name}". This rank is disabled.`);
-    return false;
-  }
-  return true;
-});
-
-// Optional: extra staff roles (for example Community Manager). Members with one of
-// these roles count as staff for ?help, but they get no moderation permissions or
-// limits from it. Comma-separated role IDs.
-const EXTRA_STAFF_ROLE_IDS = (process.env.EXTRA_STAFF_ROLE_IDS || '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
-
-// Optional: extra roles that can never be targeted by moderation commands.
-const PROTECTED_ROLE_IDS = (process.env.PROTECTED_ROLE_IDS || '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
-
-const ACTION_LABELS = { ban: 'Ban', kick: 'Kick', mute: 'Mute', warn: 'Warn' };
-const ACTION_PLURALS = { ban: 'Bans', kick: 'Kicks', mute: 'Mutes', warn: 'Warns' };
-const ACTION_PAST = { ban: 'banned', kick: 'kicked', mute: 'muted', warn: 'warned' };
-
-/* ------------------------------------------------------------------ */
-/* Persistent storage                                                  */
-/* ------------------------------------------------------------------ */
-
-let store = {};
-
-function loadStore() {
-  try {
-    store = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    if (typeof store !== 'object' || store === null || Array.isArray(store)) {
-      throw new Error('Invalid store format');
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error('[storage] Could not read the limits file. Starting from an empty store.', error.message);
-      try {
-        fs.copyFileSync(DATA_FILE, `${DATA_FILE}.corrupt-${Date.now()}`);
-      } catch (_) {
-        /* ignore backup failure */
-      }
-    }
-    store = {};
-  }
-}
-
-// Atomic write: write to a temporary file, then rename over the real one.
-function saveStore() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, DATA_FILE);
-}
-
-let warnings = {};
-
-function loadWarnings() {
-  try {
-    warnings = JSON.parse(fs.readFileSync(WARNINGS_FILE, 'utf8'));
-    if (typeof warnings !== 'object' || warnings === null || Array.isArray(warnings)) {
-      throw new Error('Invalid warnings format');
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') console.error('[storage] Could not read the warnings file.', error.message);
-    warnings = {};
-  }
-}
-
-function saveWarnings() {
-  fs.mkdirSync(path.dirname(WARNINGS_FILE), { recursive: true });
-  const tmp = `${WARNINGS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(warnings, null, 2));
-  fs.renameSync(tmp, WARNINGS_FILE);
-}
-
-function addWarning(targetId, moderatorId, reason) {
-  if (!Array.isArray(warnings[targetId])) warnings[targetId] = [];
-  warnings[targetId].push({ moderatorId, reason, timestamp: Date.now() });
-  saveWarnings();
-}
-
-// Returns the staff member's record, starting a new 10-hour period when needed.
-function getRecord(userId) {
-  const now = Date.now();
-  let record = store[userId];
-  if (!record || typeof record.resetAt !== 'number' || now >= record.resetAt) {
-    record = { resetAt: now + PERIOD_MS, ban: 0, kick: 0, mute: 0, warn: 0 };
-    store[userId] = record;
-    saveStore();
-  }
-  if (typeof record.warn !== 'number') record.warn = 0;
-  return record;
-}
-
-function resetTimestamp(record) {
-  return Math.floor(record.resetAt / 1000);
-}
-
-/* ------------------------------------------------------------------ */
-/* Per-moderator lock (prevents race conditions)                       */
-/* ------------------------------------------------------------------ */
-
-const locks = new Map();
-
-function withLock(key, task) {
-  const previous = locks.get(key) || Promise.resolve();
-  const run = previous.catch(() => {}).then(task);
-  const tail = run.catch(() => {});
-  locks.set(key, tail);
-  tail.then(() => {
-    if (locks.get(key) === tail) locks.delete(key);
-  });
-  return run;
-}
-
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildModeration,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel, Partials.Message],
-});
-
-function getRank(member) {
-  if (!member) return null;
-  for (const rank of RANKS) {
-    if (member.roles.cache.has(rank.roleId)) return rank;
-  }
-  return null;
-}
-
-function hasExtraStaffRole(member) {
-  return EXTRA_STAFF_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
-}
-
-function formatLimit(value) {
-  return value === Infinity ? 'Unlimited' : String(value);
-}
-
-function parseUserId(arg) {
-  if (!arg) return null;
-  const match = arg.match(/^<@!?(\d{17,20})>$/) || arg.match(/^(\d{17,20})$/);
-  return match ? match[1] : null;
-}
-
-function parseDuration(arg) {
-  if (!arg) return null;
-  const match = arg.match(/^(\d+)(s|m|h|d)$/i);
-  if (!match) return null;
-  const value = Number(match[1]);
-  const unit = match[2].toLowerCase();
-  const multipliers = { s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 };
-  const ms = value * multipliers[unit];
-  if (ms < 1000 || ms > MAX_TIMEOUT_MS) return null;
-  return ms;
-}
-
-function infoEmbed(title, description, color = 0x2b2d31) {
-  return new EmbedBuilder().setTitle(title).setDescription(description).setColor(color);
-}
-
-function errorEmbed(description) {
-  return infoEmbed('Error', description, 0xed4245);
-}
-
-async function sendLog(guild, embed, channelId = LOG_CHANNEL_ID) {
-  if (!channelId) return;
-  try {
-    const channel = await guild.channels.fetch(channelId);
-    if (channel && channel.isTextBased()) {
-      await channel.send({ embeds: [embed] });
-    }
-  } catch (error) {
-    console.error('[logs] Could not send a log message:', error.message);
-  }
-}
-
-function buildLogEmbed({ title, color, moderator, rank, type, target, usage, status, reason, record }) {
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(color)
-    .addFields(
-      { name: 'Moderator', value: `<@${moderator.id}> (${moderator.username}, ${moderator.id})` },
-      { name: 'Rank', value: rank.name, inline: true },
-      { name: 'Action', value: ACTION_LABELS[type], inline: true },
-      { name: 'Usage', value: usage, inline: true },
-      { name: 'Status', value: status, inline: true }
-    )
-    .setTimestamp();
-
-  if (target) embed.addFields({ name: 'Target', value: `${target.tag || 'Unknown user'} (${target.id})` });
-  if (reason) embed.addFields({ name: 'Reason', value: reason });
-  if (record && rank.limits[type] !== Infinity) {
-    embed.addFields({ name: 'Next reset', value: `<t:${resetTimestamp(record)}:R>` });
-  }
-  return embed;
-}
-
-/* ------------------------------------------------------------------ */
-/* Target validation (hierarchy and protection checks)                 */
-/* ------------------------------------------------------------------ */
-
-async function resolveTarget(guild, arg) {
-  const id = parseUserId(arg);
-  if (!id) return null;
-  const member = await guild.members.fetch(id).catch(() => null);
-  let user = member ? member.user : null;
-  if (!user) user = await client.users.fetch(id).catch(() => null);
-  return { id, member, user };
-}
-
-// Returns an error string, or null when the target is valid.
-// The same checks apply whether the target was given as a mention or a raw ID.
-function checkTarget(guild, moderatorMember, moderatorRank, target, type) {
-  if (target.id === moderatorMember.id) return 'You cannot moderate yourself.';
-  if (target.id === client.user.id) return 'You cannot moderate the bot.';
-  if (target.id === guild.ownerId) return 'This user is protected and cannot be moderated.';
-
-  if (!target.member) {
-    if (type === 'kick' || type === 'mute' || type === 'warn') return 'This user is not a member of the server.';
-    return null; // ban by ID for a user who is not in the server
-  }
-
-  const member = target.member;
-
-  if (PROTECTED_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId))) {
-    return 'This user is protected and cannot be moderated.';
-  }
-
-  const targetRank = getRank(member);
-  if (targetRank && targetRank.level >= moderatorRank.level) {
-    return 'You cannot moderate a member of equal or higher staff rank.';
-  }
-
-  const isGuildOwner = moderatorMember.id === guild.ownerId;
-  if (!isGuildOwner && moderatorMember.roles.highest.position <= member.roles.highest.position) {
-    return 'You cannot moderate a member whose highest role is equal to or above yours.';
-  }
-
-  if (type === 'ban' && !member.bannable) return 'I am not able to ban this member.';
-  if (type === 'kick' && !member.kickable) return 'I am not able to kick this member.';
-  if (type === 'mute' && !member.moderatable) return 'I am not able to mute this member.';
-
-  return null;
-}
-
-/* ------------------------------------------------------------------ */
-/* Limited action runner                                               */
-/* ------------------------------------------------------------------ */
-
-// Checks the allowance, reserves it, runs the sanction, and rolls back if it fails.
-// The whole sequence runs under a per-moderator lock so concurrent commands
-// cannot exceed a limit.
-function runLimitedAction({ message, rank, type, target, reason, perform }) {
-  const moderator = message.author;
-
-  return withLock(moderator.id, async () => {
-    const limit = rank.limits[type];
-    const unlimited = limit === Infinity;
-    const record = unlimited ? null : getRecord(moderator.id);
-
-    if (!unlimited && record[type] >= limit) {
-      const usage = `${record[type]}/${limit}`;
-      const embed = infoEmbed(
-        'Moderation Limit Reached',
-        `You have reached your ${type} limit for this 10-hour period.\n\n` +
-          `**Current usage:** ${usage}\n` +
-          `**Next reset:** <t:${resetTimestamp(record)}:R>\n\n` +
-          'You may use other moderation commands if their independent limits have not been reached.',
-        0xed4245
-      );
-      await message.reply({ embeds: [embed] }).catch(() => {});
-
-      await sendLog(
-        message.guild,
-        buildLogEmbed({
-          title: 'Moderation Limit Reached',
-          color: 0xed4245,
-          moderator,
-          rank,
-          type,
-          target,
-          usage,
-          status: 'Rejected',
-          reason: `Maximum ${type} allowance reached.`,
-          record,
-        })
-      );
-      return false;
-    }
-
-    // Reserve the allowance before executing, and persist it immediately.
-    if (!unlimited) {
-      record[type] += 1;
-      saveStore();
-    }
-
-    try {
-      await perform();
-    } catch (error) {
-      // Failed sanctions never consume an allowance.
-      if (!unlimited) {
-        record[type] = Math.max(0, record[type] - 1);
-        saveStore();
-      }
-      console.error(`[${type}] Action failed:`, error.message);
-      await message
-        .reply({
-          embeds: [errorEmbed('The action could not be completed. No moderation allowance was used.')],
-        })
-        .catch(() => {});
-      return false;
-    }
-
-    const usage = unlimited ? 'Unlimited' : `${record[type]}/${limit}`;
-    const embed = infoEmbed(
-      `${ACTION_LABELS[type]} Successful`,
-      `${target.tag || target.id} has been ${ACTION_PAST[type]}.\n\n` +
-        `**Reason:** ${reason}\n**${ACTION_PLURALS[type]} used:** ${usage}` +
-        (unlimited ? '' : `\n**Next reset:** <t:${resetTimestamp(record)}:R>`),
-      0x57f287
-    );
-    await message.reply({ embeds: [embed] }).catch(() => {});
-
-    await sendLog(
-      message.guild,
-      buildLogEmbed({
-        title: `Moderation Action: ${ACTION_LABELS[type]}`,
-        color: 0x57f287,
-        moderator,
-        rank,
-        type,
-        target,
-        usage,
-        status: 'Allowed',
-        reason,
-        record,
-      })
-    );
-    return true;
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* Commands                                                            */
-/* ------------------------------------------------------------------ */
-
-async function handleBan(message, args, rank) {
-  const target = await resolveTarget(message.guild, args[0]);
-  if (!target) {
-    return message.reply({ embeds: [errorEmbed('Usage: `?ban <user mention or ID> [reason]`')] });
-  }
-  const reason = args.slice(1).join(' ') || 'No reason provided';
-
-  const problem = checkTarget(message.guild, message.member, rank, target, 'ban');
-  if (problem) return message.reply({ embeds: [errorEmbed(problem)] });
-
-  const targetInfo = { id: target.id, tag: target.user ? target.user.tag : null };
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'ban',
-    target: targetInfo,
-    reason,
-    perform: () =>
-      message.guild.members.ban(target.id, {
-        reason: `${message.author.tag}: ${reason}`,
-        deleteMessageSeconds: 0,
-      }),
-  });
-}
-
-async function handleKick(message, args, rank) {
-  const target = await resolveTarget(message.guild, args[0]);
-  if (!target) {
-    return message.reply({ embeds: [errorEmbed('Usage: `?kick <user mention or ID> [reason]`')] });
-  }
-  const reason = args.slice(1).join(' ') || 'No reason provided';
-
-  const problem = checkTarget(message.guild, message.member, rank, target, 'kick');
-  if (problem) return message.reply({ embeds: [errorEmbed(problem)] });
-
-  const targetInfo = { id: target.id, tag: target.user ? target.user.tag : null };
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'kick',
-    target: targetInfo,
-    reason,
-    perform: () => target.member.kick(`${message.author.tag}: ${reason}`),
-  });
-}
-
-async function handleMute(message, args, rank) {
-  const target = await resolveTarget(message.guild, args[0]);
-  const duration = parseDuration(args[1]);
-  if (!target || !duration) {
-    return message.reply({
-      embeds: [
-        errorEmbed(
-          'Usage: `?mute <user mention or ID> <duration> [reason]`\n' +
-            'Duration examples: `30m`, `2h`, `1d` (maximum 28d).'
-        ),
-      ],
-    });
-  }
-  const reason = args.slice(2).join(' ') || 'No reason provided';
-
-  const problem = checkTarget(message.guild, message.member, rank, target, 'mute');
-  if (problem) return message.reply({ embeds: [errorEmbed(problem)] });
-
-  const targetInfo = { id: target.id, tag: target.user ? target.user.tag : null };
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'mute',
-    target: targetInfo,
-    reason,
-    perform: () => target.member.timeout(duration, `${message.author.tag}: ${reason}`),
-  });
-}
-
-async function handleWarn(message, args, rank) {
-  const target = await resolveTarget(message.guild, args[0]);
-  const reason = args.slice(1).join(' ').trim();
-  if (!target || !reason) {
-    return message.reply({
-      embeds: [errorEmbed('Usage: `?warn <user mention or ID> <reason>` (a reason is required)')],
-    });
-  }
-
-  const problem = checkTarget(message.guild, message.member, rank, target, 'warn');
-  if (problem) return message.reply({ embeds: [errorEmbed(problem)] });
-
-  const targetInfo = { id: target.id, tag: target.user ? target.user.tag : null };
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'warn',
-    target: targetInfo,
-    reason,
-    perform: async () => {
-      addWarning(target.id, message.author.id, reason);
-      // Notify the member. A closed DM never makes the warning fail.
-      await target.user
-        .send({
-          embeds: [
-            infoEmbed(
-              'You have received a warning',
-              `**Server:** ${message.guild.name}\n**Reason:** ${reason}`,
-              0xfee75c
-            ),
-          ],
-        })
-        .catch(() => {});
-    },
-  });
-}
-
-// Unban and unmute never consume an allowance.
-async function handleUnban(message, args) {
-  const id = parseUserId(args[0]);
-  if (!id) {
-    return message.reply({ embeds: [errorEmbed('Usage: `?unban <user ID> [reason]`')] });
-  }
-  const reason = args.slice(1).join(' ') || 'No reason provided';
-  try {
-    await message.guild.bans.remove(id, `${message.author.tag}: ${reason}`);
-    await message.reply({ embeds: [infoEmbed('Unban Successful', `User ${id} has been unbanned.`, 0x57f287)] });
-    await sendLog(
-      message.guild,
-      infoEmbed(
-        'Moderation Action: Unban',
-        `Moderator: <@${message.author.id}> (${message.author.username}, ${message.author.id})\n` +
-          `Target ID: ${id}\nReason: ${reason}`,
-        0x57f287
-      ).setTimestamp()
-    );
-  } catch (error) {
-    console.error('[unban] Action failed:', error.message);
-    await message.reply({ embeds: [errorEmbed('The user could not be unbanned.')] }).catch(() => {});
-  }
-}
-
-async function handleUnmute(message, args) {
-  const target = await resolveTarget(message.guild, args[0]);
-  if (!target || !target.member) {
-    return message.reply({ embeds: [errorEmbed('Usage: `?unmute <user mention or ID> [reason]`')] });
-  }
-  const reason = args.slice(1).join(' ') || 'No reason provided';
-  try {
-    await target.member.timeout(null, `${message.author.tag}: ${reason}`);
-    await message.reply({
-      embeds: [infoEmbed('Unmute Successful', `${target.user.tag} has been unmuted.`, 0x57f287)],
-    });
-    await sendLog(
-      message.guild,
-      infoEmbed(
-        'Moderation Action: Unmute',
-        `Moderator: <@${message.author.id}> (${message.author.username}, ${message.author.id})\n` +
-          `Target: ${target.user.tag} (${target.id})\nReason: ${reason}`,
-        0x57f287
-      ).setTimestamp()
-    );
-  } catch (error) {
-    console.error('[unmute] Action failed:', error.message);
-    await message.reply({ embeds: [errorEmbed('The user could not be unmuted.')] }).catch(() => {});
-  }
-}
-
-async function handleLimits(message, args, rank) {
-  let subjectMember = message.member;
-  let subjectRank = rank;
-
-  // Only the Owner rank may inspect another moderator's limits.
-  if (args[0]) {
-    if (rank.key !== 'owner') return null;
-    const id = parseUserId(args[0]);
-    const member = id ? await message.guild.members.fetch(id).catch(() => null) : null;
-    const memberRank = getRank(member);
-    if (!member || !memberRank) {
-      return message.reply({ embeds: [errorEmbed('That user does not hold a configured staff role.')] });
-    }
-    subjectMember = member;
-    subjectRank = memberRank;
-  }
-
-  const isSelf = subjectMember.id === message.author.id;
-  const title = isSelf ? 'Your Moderation Limits' : `Moderation Limits: ${subjectMember.user.tag}`;
-
-  if (subjectRank.key === 'owner') {
-    return message.reply({
-      embeds: [
-        infoEmbed(
-          title,
-          `**${subjectRank.name}**\n\n- Bans: Unlimited\n- Kicks: Unlimited\n- Mutes: Unlimited\n- Warns: Unlimited`
-        ),
-      ],
-    });
-  }
-
-  const record = getRecord(subjectMember.id);
-  const lines = ['ban', 'kick', 'mute', 'warn']
-    .map((type) => `- ${ACTION_PLURALS[type]}: ${record[type]}/${formatLimit(subjectRank.limits[type])} used`)
-    .join('\n');
-
-  return message.reply({
-    embeds: [
-      infoEmbed(
-        title,
-        `**${subjectRank.name}**\n\n${lines}\n\nNext reset: <t:${resetTimestamp(record)}:R> (<t:${resetTimestamp(record)}:F>)`
-      ),
-    ],
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* Fun command: ?CheckThisFemboy                                       */
-/* ------------------------------------------------------------------ */
-
-const FEMBOY_ITEMS = [
-  'Thigh highs (x7)',
-  'A suspicious number of hoodies',
-  'Programming socks',
-  'A hidden catgirl maid outfit',
-  'Pink keyboard with RGB',
-  'An anime figure collection',
-  'Headphones with cat ears',
-  'Iced matcha latte',
-  'A "totally not for me" skirt',
-  'A playlist full of vocaloid',
-];
-
-const FEMBOY_VERDICTS = [
-  'Certified by the Council of Femboys.',
-  'Scientists are still studying this case.',
-  'The FBI agent in the walls approves.',
-  'Cannot be explained by modern science.',
-  'This result has been verified by 3 Discord kittens.',
-  'The bot got scared and double-checked its math.',
-];
-
-function femboyComment(percent) {
-  if (percent === 100) return 'PERFECT SCORE. Absolute legend. Bow down. 👑';
-  if (percent >= 90) return 'Basically a walking femboy meme. No escape.';
-  if (percent >= 70) return 'Strong femboy energy detected. Skirt incoming.';
-  if (percent >= 50) return 'Half femboy, half mystery. Dangerous combo.';
-  if (percent >= 30) return 'A little spark of femboy is growing inside...';
-  if (percent >= 10) return 'Mostly normal... but the bot has doubts.';
-  return 'Is this person even human?? 0 femboy detected, sir.';
-}
-
-function femboyBar(percent) {
-  const filled = Math.round(Math.min(percent, 100) / 10);
-  return `${'🟪'.repeat(filled)}${'⬛'.repeat(10 - filled)}`;
-}
-
-async function handleCheckFemboy(message, args) {
-  const target = await resolveTarget(message.guild, args[0]);
-  if (!target || !target.user) {
-    return message.reply({ embeds: [errorEmbed('Usage: `?CheckThisFemboy <user mention or ID>`')] });
-  }
-
-  const isBot = target.id === client.user.id;
-  const percent = isBot ? 1000 : Math.floor(Math.random() * 101);
-
-  // Funny thing #1: a funny comment depending on the percentage.
-  const comment = isBot ? 'The bot is the ultimate femboy. Off the charts. Do not question it.' : femboyComment(percent);
-
-  // Funny thing #2: random "evidence" items found in the user's room.
-  const shuffled = [...FEMBOY_ITEMS].sort(() => Math.random() - 0.5).slice(0, 3);
-
-  // Funny thing #3: a random official verdict.
-  const verdict = FEMBOY_VERDICTS[Math.floor(Math.random() * FEMBOY_VERDICTS.length)];
-
-  const embed = new EmbedBuilder()
-    .setTitle('🎀 Femboy Scanner 3000 🎀')
-    .setColor(0xff69b4)
-    .setDescription(
-      `Scan result for **${target.user.tag}**\n\n` +
-        `${femboyBar(percent)}\n**${percent}% femboy**\n\n` +
-        `*${comment}*`
-    )
-    .addFields(
-      { name: '🔍 Evidence found', value: shuffled.map((item) => `- ${item}`).join('\n') },
-      { name: '📜 Official verdict', value: verdict }
-    )
-    .setFooter({ text: 'This scan is 100% scientific. Trust me bro.' })
-    .setTimestamp();
-
-  return message.reply({ embeds: [embed], allowedMentions: { repliedUser: false } });
-}
-
-async function handleHelp(message, rank) {
-  const lines = [
-    '`?ban <@user or ID> [reason]` - Ban a user (uses a ban)',
-    '`?kick <@user or ID> [reason]` - Kick a member (uses a kick)',
-    '`?mute <@user or ID> <duration> [reason]` - Mute a member (uses a mute)',
-    '`?warn <@user or ID> <reason>` - Warn a member (uses a warn)',
-    '`?unban <user ID> [reason]` - Unban a user',
-    '`?unmute <@user or ID> [reason]` - Remove a mute',
-    '`?limits` - Show your moderation limits and next reset',
-  ];
-
-  if (rank) {
-    lines.push('`?CheckThisFemboy <@user or ID>` - Check how much of a femboy someone is');
-  }
-
-  if (rank && rank.key === 'owner') {
-    lines.push("`?limits <@user or ID>` - Show another staff member's limits");
-  }
-
-  lines.push('`?help` - Show this message');
-
-  const rankLabel = rank ? rank.name : 'Staff (no moderation rank)';
-  const note = rank
-    ? 'Mute durations: `30m`, `2h`, `1d` (maximum 28d).'
-    : 'Your staff role does not grant access to the moderation commands above.';
-
-  return message.reply({
-    embeds: [infoEmbed('Moderation Commands', `**Your rank:** ${rankLabel}\n\n${lines.join('\n')}\n\n${note}`)],
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* Message handler                                                     */
-/* ------------------------------------------------------------------ */
-
-client.on('messageCreate', async (message) => {
-  try {
-    if (message.author.bot || !message.guild) return;
-    if (!message.content.startsWith(PREFIX)) return;
-
-    const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
-    const command = (args.shift() || '').toLowerCase();
-
-    const known = ['ban', 'kick', 'mute', 'unban', 'unmute', 'limits', 'help', 'warn', 'checkthisfemboy'];
-    if (!known.includes(command)) return;
-
-    console.log(`[command] ?${command} from ${message.author.tag} (${message.author.id})`);
-
-    // Make sure the member and their roles are fresh.
-    // message.member is read-only. Fetching caches the member, which fills the getter.
-    if (!message.member) await message.guild.members.fetch(message.author.id).catch(() => null);
-    const member = message.member;
-
-    // Joke: one specific user gets roasted if they try ?help without a staff rank
-    // (no Trial Moderator, Moderator, Senior Moderator, Supervisor or Owner role).
-    if (command === 'help' && message.author.id === PEASANT_USER_ID && !getRank(member)) {
-      return await message.reply('Shut up peasant, grind roles and come back after you got Trial Mod 💀');
-    }
-
-    if (!member) return;
-
-    const rank = getRank(member);
-
-    // Non-staff members are ignored silently. Staff information is never exposed.
-    // getRank uses the highest configured rank, so extra roles never lower it.
-    if (!rank && !hasExtraStaffRole(member)) return;
-
-    // ?help is available to every staff member.
-    if (command === 'help') return await handleHelp(message, rank);
-
-    // Everything else requires a moderation rank (Trial Moderator and above).
-    if (!rank) return;
-
-    switch (command) {
-      case 'ban':
-        return await handleBan(message, args, rank);
-      case 'kick':
-        return await handleKick(message, args, rank);
-      case 'mute':
-        return await handleMute(message, args, rank);
-      case 'warn':
-        return await handleWarn(message, args, rank);
-      case 'unban':
-        return await handleUnban(message, args);
-      case 'unmute':
-        return await handleUnmute(message, args);
-      case 'limits':
-        return await handleLimits(message, args, rank);
-      case 'checkthisfemboy':
-        return await handleCheckFemboy(message, args);
-      default:
-        return null;
-    }
-  } catch (error) {
-    console.error('[messageCreate] Unexpected error:', error.message);
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* Message logs                                                        */
-/* ------------------------------------------------------------------ */
-
-function truncate(text, max = 1000) {
-  if (!text) return '(no text content)';
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
-}
-
-function describeAuthor(author) {
-  return author ? `<@${author.id}> (${author.tag}, ${author.id})` : 'Unknown (message was not cached)';
-}
-
-function attachmentList(message) {
-  if (!message.attachments || message.attachments.size === 0) return null;
-  return truncate([...message.attachments.values()].map((a) => a.url).join('\n'));
-}
-
-client.on('messageDelete', async (message) => {
-  try {
-    if (!message.guild || message.channelId === MESSAGE_LOG_CHANNEL_ID) return;
-    if (message.author && message.author.bot) return;
-
-    const embed = new EmbedBuilder()
-      .setTitle('Message Deleted')
-      .setColor(0xed4245)
-      .addFields(
-        { name: 'Author', value: describeAuthor(message.author) },
-        { name: 'Channel', value: `<#${message.channelId}>` },
-        { name: 'Content', value: truncate(message.content) }
-      )
-      .setTimestamp();
-    const files = attachmentList(message);
-    if (files) embed.addFields({ name: 'Attachments', value: files });
-
-    await sendLog(message.guild, embed, MESSAGE_LOG_CHANNEL_ID);
-  } catch (error) {
-    console.error('[messageDelete] Unexpected error:', error.message);
-  }
-});
-
-client.on('messageUpdate', async (oldMessage, newMessage) => {
-  try {
-    if (newMessage.partial) await newMessage.fetch().catch(() => null);
-    if (!newMessage.guild || newMessage.channelId === MESSAGE_LOG_CHANNEL_ID) return;
-    if (newMessage.author && newMessage.author.bot) return;
-    if (oldMessage.content === newMessage.content) return; // embeds or pins, not an edit
-
-    const embed = new EmbedBuilder()
-      .setTitle('Message Edited')
-      .setColor(0xfee75c)
-      .addFields(
-        { name: 'Author', value: describeAuthor(newMessage.author) },
-        { name: 'Channel', value: `<#${newMessage.channelId}> ([jump to message](${newMessage.url}))` },
-        { name: 'Before', value: truncate(oldMessage.content) },
-        { name: 'After', value: truncate(newMessage.content) }
-      )
-      .setTimestamp();
-
-    await sendLog(newMessage.guild, embed, MESSAGE_LOG_CHANNEL_ID);
-  } catch (error) {
-    console.error('[messageUpdate] Unexpected error:', error.message);
-  }
-});
-
-// Optional: log every message that is sent (LOG_ALL_MESSAGES=true).
-client.on('messageCreate', async (message) => {
-  try {
-    if (!LOG_ALL_MESSAGES) return;
-    if (!message.guild || message.author.bot || message.channelId === MESSAGE_LOG_CHANNEL_ID) return;
-
-    const embed = new EmbedBuilder()
-      .setTitle('Message Sent')
-      .setColor(0x5865f2)
-      .addFields(
-        { name: 'Author', value: describeAuthor(message.author) },
-        { name: 'Channel', value: `<#${message.channelId}> ([jump to message](${message.url}))` },
-        { name: 'Content', value: truncate(message.content) }
-      )
-      .setTimestamp();
-    const files = attachmentList(message);
-    if (files) embed.addFields({ name: 'Attachments', value: files });
-
-    await sendLog(message.guild, embed, MESSAGE_LOG_CHANNEL_ID);
-  } catch (error) {
-    console.error('[messageCreate log] Unexpected error:', error.message);
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/* Startup                                                             */
-/* ------------------------------------------------------------------ */
-
-// Minimal HTTP server so Render detects an open port (Web Service hosting).
-const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running.');
-  })
-  .listen(PORT, () => console.log(`Health server listening on port ${PORT}`));
-
-client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-process.on('unhandledRejection', (error) => {
-  console.error('[process] Unhandled rejection:', error && error.message ? error.message : error);
-});
-
-if (!TOKEN) {
-  console.error('Missing TOKEN environment variable.');
+const { TOKEN, GUILD_ID, COUNTRY_CHANNEL_ID, EMBED_PERMS_ROLE_ID } = process.env;
+const BACKUP_CHANNEL_ID = process.env.BACKUP_CHANNEL_ID || '1564234091111649411';
+const BACKUP_MS = 90 * 60 * 1000; // every 1h30
+const HOST_ID = process.env.HOST_ID || '1356027898372559079'; // only this user can host drops and minigames
+const GAME_MS = 60 * 1000;                                    // minigame duration
+const SPAWN_MS = Number(process.env.SPAWN_MS) || 210000;   // 3 min 30 s
+const FARM_COOLDOWN = 80 * 1000;                            // 1 min 20 s
+const DAILY_COOLDOWN = 20 * 60 * 60 * 1000;
+const WAR_COOLDOWN = 5 * 60 * 1000;
+const MAX_MASTERY = 50;
+const CLAIM_WINDOW = 3 * 60 * 1000;
+const DATA_FILE = process.env.DATA_FILE || './data.json';
+
+if (!TOKEN || !GUILD_ID || !COUNTRY_CHANNEL_ID) {
+  console.error('Missing env vars: TOKEN, GUILD_ID and COUNTRY_CHANNEL_ID are required.');
   process.exit(1);
 }
 
-// Country collecting game (slash commands, spawns in its own channel).
-// Needs countries.js in the same folder as this file.
+/* ------------------------------ COUNTRIES ------------------------------
+   [name, rarity, trade%, sociable%, war%, allies%]   (world of 1750)     */
+const RAW = [
+  ['Great Britain','Legendary',85,55,80,70],['France','Legendary',75,60,85,65],
+  ['Qing China','Legendary',90,25,75,30],['Ottoman Empire','Legendary',80,40,90,45],
+  ['Russian Empire','Legendary',50,35,94,50],
+  ['Spain','Epic',70,50,70,60],['Dutch Republic','Epic',95,65,40,75],
+  ['Habsburg Austria','Epic',55,60,75,80],['Prussia','Epic',40,35,97,55],
+  ['Portugal','Epic',80,55,45,70],['Sweden','Epic',45,50,70,60],
+  ['Tokugawa Japan','Epic',35,15,65,10],['Maratha Confederacy','Epic',50,40,85,45],
+  ['Mughal Empire','Epic',75,45,60,50],['Afsharid Persia','Epic',55,30,85,35],
+  ['Venice','Epic',90,70,35,65],
+  ['Joseon Korea','Rare',45,20,40,25],['Denmark-Norway','Rare',60,55,50,60],
+  ['Poland-Lithuania','Rare',45,60,55,55],['Savoy','Rare',40,50,60,65],
+  ['Genoa','Rare',80,60,25,60],['Papal States','Rare',50,75,15,85],
+  ['Kingdom of Naples','Rare',45,55,40,55],['Bavaria','Rare',40,50,55,60],
+  ['Saxony','Rare',50,55,45,60],['Morocco','Rare',55,35,60,40],
+  ['Algiers','Rare',60,25,75,30],['Mamluk Egypt','Rare',65,40,55,40],
+  ['Ethiopia','Rare',30,35,60,35],['Ashanti','Rare',60,40,75,35],
+  ['Dahomey','Rare',50,25,85,25],['Siam','Rare',65,50,50,45],
+  ['Burma','Rare',40,25,75,25],['Mysore','Rare',45,30,70,35],
+  ['Hyderabad','Rare',60,50,45,55],['Oman','Rare',80,55,40,50],
+  ['Durrani Empire','Rare',40,30,85,30],['Iroquois Confederacy','Rare',50,70,65,85],
+  ['Comanche','Rare',30,20,90,25],['Crimean Khanate','Rare',40,25,80,40],
+  ['Tibet','Uncommon',30,45,15,45],['Switzerland','Uncommon',65,70,30,30],
+  ['Tuscany','Uncommon',60,70,20,60],['Hanover','Uncommon',45,55,45,70],
+  ['Wallachia','Uncommon',45,45,40,40],['Moldavia','Uncommon',40,45,40,40],
+  ['Montenegro','Uncommon',15,30,70,40],['Ragusa','Uncommon',75,75,10,65],
+  ['Knights of Malta','Uncommon',55,50,60,60],['Tunis','Uncommon',55,40,45,40],
+  ['Tripoli','Uncommon',50,30,55,35],['Oyo','Uncommon',55,40,65,40],
+  ['Kongo','Uncommon',40,45,40,45],['Benin','Uncommon',60,40,45,35],
+  ['Bornu','Uncommon',50,35,50,35],['Buganda','Uncommon',40,35,60,35],
+  ['Merina','Uncommon',35,40,55,30],['Yemen','Uncommon',45,35,35,40],
+  ['Emirate of Diriyah','Uncommon',25,30,65,45],['Bukhara','Uncommon',65,45,40,40],
+  ['Khiva','Uncommon',45,25,60,30],['Kazakh Khanate','Uncommon',30,40,70,45],
+  ['Nepal','Uncommon',30,35,55,30],['Ryukyu','Uncommon',80,75,5,65],
+  ['Aceh','Uncommon',65,40,50,40],['Mataram','Uncommon',45,35,55,35],
+  ['Brunei','Uncommon',60,45,35,40],['Gowa','Uncommon',65,45,50,40],
+  ['Dai Viet','Uncommon',45,30,65,30],['Sikh Confederacy','Uncommon',40,40,80,50],
+  ['Travancore','Uncommon',65,50,40,50],['Bengal','Uncommon',80,45,35,40],
+  ['Cherokee','Uncommon',45,60,55,65],['Creek','Uncommon',40,55,60,60],
+  ['Lakota','Uncommon',25,35,80,45],
+  ['Mapuche','Common',20,25,80,30],['Guarani','Common',30,50,45,45],
+  ['Georgia','Common',35,45,50,60],['Hawaii','Common',25,55,55,40],
+  ['Tonga','Common',25,60,50,50],['Maori','Common',20,40,75,35],
+  ['Cree','Common',45,60,30,55],['Greenland Inuit','Common',20,60,10,30],
+  ['Sami','Common',30,55,10,40],['Haida','Common',40,45,55,30],
+  ['Aleut','Common',20,40,25,25],['Kandy','Common',40,45,40,45],
+  ['Ahom Kingdom','Common',35,40,50,35],['Luang Prabang','Common',35,55,25,45],
+  ['Cambodia','Common',40,45,30,40],['Bhutan','Common',20,35,30,35],
+  ['Futa Toro','Common',40,40,45,35],['Kuba Kingdom','Common',35,50,30,40],
+  ['Rozvi Empire','Common',35,35,55,30],['Wadai Sultanate','Common',40,30,50,30],
+  ['Darfur Sultanate','Common',40,35,50,35],['Funj Sultanate','Common',45,40,45,40],
+  ['Kingdom of Kaffa','Common',30,30,45,30],['Blackfoot Confederacy','Common',30,40,70,45],
+  ['Apache','Common',20,20,85,25],
+  // --- 20 more countries of 1750 ---
+  ['Dzungar Khanate','Rare',40,20,88,25],['Lunda Empire','Rare',65,45,55,45],
+  ['Kokand Khanate','Uncommon',45,40,65,35],['Zaporozhian Cossacks','Uncommon',30,50,75,55],
+  ['Awadh','Uncommon',65,50,45,50],['Jaipur','Uncommon',55,50,45,55],
+  ['Bharatpur Jats','Uncommon',40,35,70,45],['Luba Empire','Uncommon',45,40,55,40],
+  ['Bambara Empire','Uncommon',45,35,70,35],['Sakalava Kingdom','Uncommon',45,40,55,35],
+  ['Futa Jallon','Uncommon',40,40,60,45],['Hausa City-States','Uncommon',70,45,40,40],
+  ['Johor Sultanate','Uncommon',70,50,40,45],['Sulu Sultanate','Uncommon',60,35,60,35],
+  ['Mrauk-U Arakan','Uncommon',55,35,55,35],['Nguyen Lords','Uncommon',50,35,60,35],
+  ['Hesse-Kassel','Uncommon',35,50,65,70],['Mossi Kingdoms','Common',30,40,60,40],
+  ['Kingdom of Rwanda','Common',25,30,65,30],['Duchy of Courland','Common',55,55,25,60],
+];
+const COUNTRIES = RAW.map(([name, rarity, trade, sociable, war, allies]) => ({ name, rarity, trade, sociable, war, allies }));
+const BY_NAME = new Map(COUNTRIES.map(c => [c.name.toLowerCase(), c]));
+const RARITY_WEIGHT = { Common: 50, Uncommon: 28, Rare: 14, Epic: 6, Legendary: 2 };
+const RARITY_COLOR = { Common: 0x95a5a6, Uncommon: 0x2ecc71, Rare: 0x3498db, Epic: 0x9b59b6, Legendary: 0xf1c40f };
 
+/* ------------------------------ DATABASE ------------------------------ */
+let db = { users: {}, factions: {} };
+let restored = false;   // true once the last backup has been loaded (or none exists)
+let dirty = false;      // true when data changed since the last backup
+function save() { dirty = true; }
 
-loadStore();
-loadWarnings();
-client.login(TOKEN);
+// Backups live in a Discord channel as JSON files, so they survive redeploys.
+async function restoreBackup() {
+  for (let attempt = 1; attempt <= 3 && !restored; attempt++) {
+    try {
+      const ch = await client.channels.fetch(BACKUP_CHANNEL_ID);
+      const msgs = await ch.messages.fetch({ limit: 50 });
+      const m = msgs.filter(x => x.author.id === client.user.id && x.attachments.size && x.attachments.first().name.startsWith('backup')).first();
+      if (m) {
+        const res = await fetch(m.attachments.first().url);
+        db = { users: {}, factions: {}, ...(await res.json()) };
+        console.log(`Backup restored (${Object.keys(db.users).length} players).`);
+      } else console.log('No backup found, starting fresh.');
+      restored = true;
+    } catch (e) {
+      console.error(`Restore attempt ${attempt} failed:`, e.message);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+  if (!restored) { console.error('Could not read the backup channel. Stopping to avoid overwriting your data.'); process.exit(1); }
+}
+async function doBackup(force = false) {
+  if (!restored || (!dirty && !force)) return false;
+  try {
+    const ch = await client.channels.fetch(BACKUP_CHANNEL_ID);
+    const name = `backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const file = new AttachmentBuilder(Buffer.from(JSON.stringify(db)), { name });
+    await ch.send({ content: `Backup: ${Object.keys(db.users).length} players, ${Object.keys(db.factions).length} factions`, files: [file] });
+    dirty = false;
+    try { // keep only the 5 latest backups
+      const msgs = await ch.messages.fetch({ limit: 50 });
+      const mine = [...msgs.filter(x => x.author.id === client.user.id && x.attachments.size).values()];
+      for (const old of mine.slice(5)) await old.delete();
+    } catch {}
+    return true;
+  } catch (e) { console.error('Backup failed:', e.message); return false; }
+}
+function U(id) {
+  if (!db.users[id]) db.users[id] = { countries: {}, lastFarm: 0, lastDaily: 0, lastWar: 0, redeemed: false, wins: 0, losses: 0, faction: null, allies: [] };
+  return db.users[id];
+}
+
+/* ------------------------------ HELPERS ------------------------------ */
+const bar = (m) => { const f = Math.round((m / MAX_MASTERY) * 10); return `[${'#'.repeat(f)}${'-'.repeat(10 - f)}] ${m}/${MAX_MASTERY}`; };
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const rnd = (a, b) => a + Math.random() * (b - a);
+const eph = { flags: MessageFlags.Ephemeral };
+const masteredCount = (u) => Object.values(u.countries).filter(m => m >= MAX_MASTERY).length;
+const totalMastery = (u) => Object.values(u.countries).reduce((a, b) => a + b, 0);
+function weightedCountry() {
+  const pool = COUNTRIES.map(c => [c, RARITY_WEIGHT[c.rarity]]);
+  let r = Math.random() * pool.reduce((s, [, w]) => s + w, 0);
+  for (const [c, w] of pool) { if ((r -= w) <= 0) return c; }
+  return COUNTRIES[0];
+}
+// Aggressive empires hit hard but defend worse: their War % is multiplied by this when they are attacked.
+// Add or change entries here (1 = normal defense, lower = weaker defense).
+const DEFENSE_MULT = { 'Prussia': 0.70, 'Russian Empire': 0.75, 'Ottoman Empire': 0.75 };
+const defMult = (c) => DEFENSE_MULT[c.name] ?? 1;
+function bestWarCountry(u, defending = false) {
+  let best = null, score = -1;
+  for (const [n, m] of Object.entries(u.countries)) {
+    const c = BY_NAME.get(n.toLowerCase()); if (!c) continue;
+    const s = c.war * (defending ? defMult(c) : 1) * (0.5 + m / MAX_MASTERY);
+    if (s > score) { score = s; best = { c, m }; }
+  }
+  return best;
+}
+const factionKey = (n) => n.trim().toLowerCase();
+function factionPower(f) { return f.members.reduce((s, id) => s + totalMastery(U(id)), 0); }
+
+/* ------------------------------ CLIENT ------------------------------ */
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+/* ------------------------------ COMMANDS ------------------------------ */
+const commands = [
+  new SlashCommandBuilder().setName('collection').setDescription('See the countries you (or someone else) own')
+    .addUserOption(o => o.setName('user').setDescription('Whose collection?')),
+  new SlashCommandBuilder().setName('leaderboard').setDescription('Top players and factions')
+    .addStringOption(o => o.setName('type').setDescription('What to rank').addChoices(
+      { name: 'Total mastery', value: 'mastery' }, { name: 'Countries owned', value: 'countries' },
+      { name: 'War victories', value: 'wins' }, { name: 'Factions', value: 'factions' })),
+  new SlashCommandBuilder().setName('farm').setDescription('Farm mastery on one of your countries (1m20s cooldown)')
+    .addStringOption(o => o.setName('country').setDescription('Which country?').setAutocomplete(true)),
+  new SlashCommandBuilder().setName('redeem').setDescription('Redeem the embed/GIF perms role (needs 3 countries at mastery 50)'),
+  new SlashCommandBuilder().setName('war').setDescription('Declare war on another player')
+    .addUserOption(o => o.setName('target').setDescription('Who do you attack?').setRequired(true))
+    .addStringOption(o => o.setName('country').setDescription('Your country (default: your strongest)').setAutocomplete(true)),
+  new SlashCommandBuilder().setName('allies').setDescription('Manage your alliances')
+    .addSubcommand(s => s.setName('propose').setDescription('Propose an alliance').addUserOption(o => o.setName('user').setDescription('Future ally').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List your allies'))
+    .addSubcommand(s => s.setName('break').setDescription('Break an alliance').addUserOption(o => o.setName('user').setDescription('Ally to drop').setRequired(true))),
+  new SlashCommandBuilder().setName('faction').setDescription('Factions')
+    .addSubcommand(s => s.setName('create').setDescription('Create a faction').addStringOption(o => o.setName('name').setDescription('Faction name').setRequired(true).setMaxLength(32)))
+    .addSubcommand(s => s.setName('join').setDescription('Join a faction').addStringOption(o => o.setName('name').setDescription('Faction name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('leave').setDescription('Leave your faction'))
+    .addSubcommand(s => s.setName('info').setDescription('Faction info').addStringOption(o => o.setName('name').setDescription('Faction name (default: yours)').setAutocomplete(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List all factions'))
+    .addSubcommand(s => s.setName('disband').setDescription('Disband your faction (leader only)')),
+  // --- 3 extras ---
+  new SlashCommandBuilder().setName('profile').setDescription('Your empire at a glance')
+    .addUserOption(o => o.setName('user').setDescription('Whose profile?')),
+  new SlashCommandBuilder().setName('trade').setDescription('Swap one of your countries with another player (mastery resets to 0)')
+    .addUserOption(o => o.setName('user').setDescription('Trade partner').setRequired(true))
+    .addStringOption(o => o.setName('give').setDescription('Country you give').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('get').setDescription('Country you want').setRequired(true).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('daily').setDescription('Claim your daily royal tribute (+5 mastery on a random country)'),
+  new SlashCommandBuilder().setName('give').setDescription('Give a country to another player')
+    .addUserOption(o => o.setName('to').setDescription('Who receives it?').setRequired(true))
+    .addStringOption(o => o.setName('country').setDescription('Country to give').setRequired(true).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('backup').setDescription('Admins only: save all player data now'),
+  new SlashCommandBuilder().setName('host').setDescription('Host only: country drops and minigames')
+    .addSubcommand(s => s.setName('now').setDescription('Drop a chosen country right now')
+      .addStringOption(o => o.setName('country').setDescription('Country to drop').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('next').setDescription('Choose the country of the next automatic drop')
+      .addStringOption(o => o.setName('country').setDescription('Country for the next drop').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('guess').setDescription('Number guessing game (60s). The winner gets the country')
+      .addIntegerOption(o => o.setName('number').setDescription('The secret number').setRequired(true).setMinValue(1))
+      .addStringOption(o => o.setName('country').setDescription('Prize country').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o => o.setName('max').setDescription('Highest possible number (default 100)').setMinValue(2)))
+    .addSubcommand(s => s.setName('quiz').setDescription('Question game (60s). The winner gets the country')
+      .addStringOption(o => o.setName('question').setDescription('The question').setRequired(true).setMaxLength(300))
+      .addStringOption(o => o.setName('answer').setDescription('The correct answer').setRequired(true).setMaxLength(100))
+      .addStringOption(o => o.setName('country').setDescription('Prize country').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('stop').setDescription('Cancel the running minigame')),
+  new SlashCommandBuilder().setName('guess').setDescription('Guess the number in the running game')
+    .addIntegerOption(o => o.setName('number').setDescription('Your guess').setRequired(true)),
+  new SlashCommandBuilder().setName('answer').setDescription('Answer the question in the running game')
+    .addStringOption(o => o.setName('text').setDescription('Your answer').setRequired(true).setMaxLength(100)),
+].map(c => c.toJSON());
+
+/* ------------------------------ SPAWNING ------------------------------ */
+const spawns = new Map(); // messageId -> { country, claimedBy }
+async function spawnCountry(forced) {
+  try {
+    const channel = await client.channels.fetch(COUNTRY_CHANNEL_ID);
+    // A country picked by the host (immediate drop, or queued for the next automatic drop) wins over the random pick
+    const c = (forced && forced.name ? forced : null) || forcedQueue.shift() || weightedCountry();
+    const embed = new EmbedBuilder()
+      .setColor(RARITY_COLOR[c.rarity])
+      .setTitle(`A wild country appeared: ${c.name}`)
+      .setDescription(`The year is 1750. Envoys of **${c.name}** are at your gates.\nBe the first to welcome them.`)
+      .addFields(
+        { name: 'Rarity', value: c.rarity, inline: true },
+        { name: 'Trade', value: `${c.trade}%`, inline: true },
+        { name: 'Sociable', value: `${c.sociable}%`, inline: true },
+        { name: 'War', value: `${c.war}%`, inline: true },
+        { name: 'Allies', value: `${c.allies}%`, inline: true },
+      );
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('claim').setLabel('Take them in').setStyle(ButtonStyle.Success));
+    const msg = await channel.send({ embeds: [embed], components: [row] });
+    spawns.set(msg.id, { country: c, claimedBy: null });
+    setTimeout(async () => {
+      const s = spawns.get(msg.id);
+      if (s && !s.claimedBy) {
+        spawns.delete(msg.id);
+        const e = EmbedBuilder.from(embed).setFooter({ text: 'The envoys left, nobody welcomed them.' });
+        msg.edit({ embeds: [e], components: [] }).catch(() => {});
+      }
+    }, CLAIM_WINDOW);
+  } catch (e) { console.error('Spawn failed:', e.message); }
+}
+
+/* ------------------------------ FARM EVENTS ------------------------------ */
+const FARM_EVENTS = [
+  ['Trade caravans doubled the harvest', 1], ['A bumper harvest filled the granaries', 1],
+  ['Scholars opened a new academy', 1], ['A royal wedding boosted morale', 1],
+  ['Merchants struck a lucrative deal', 1], ['A wandering engineer improved the roads', 1],
+  ['A great festival united the people', 2], ['A hidden silver mine was discovered', 2],
+  ['A quiet day, the fields did their work', 0], ['Rain was kind this season', 0],
+];
+
+/* ------------------------------ INTERACTIONS ------------------------------ */
+const pendingTrades = new Map();
+const pendingAllies = new Map();
+let counter = 0;
+const nid = () => `${Date.now().toString(36)}${(counter++).toString(36)}`;
+
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    if (i.isAutocomplete()) return handleAutocomplete(i);
+    if (i.isButton()) return handleButton(i);
+    if (!i.isChatInputCommand()) return;
+    const handlers = { collection, leaderboard, farm, redeem, war, allies, faction, profile, trade, daily, give, backup, host: hostCmd, guess: guessCmd, answer: answerCmd };
+    await handlers[i.commandName]?.(i);
+  } catch (e) {
+    console.error(e);
+    const out = { content: 'Something went wrong, try again.', ...eph };
+    if (i.deferred || i.replied) i.followUp(out).catch(() => {}); else i.reply?.(out).catch(() => {});
+  }
+});
+
+function handleAutocomplete(i) {
+  const f = i.options.getFocused(true);
+  const q = f.value.toLowerCase();
+  const u = U(i.user.id);
+  let choices = [];
+  if (i.commandName === 'host') {
+    choices = COUNTRIES.map(c => c.name);
+  } else if (i.commandName === 'faction') {
+    choices = Object.values(db.factions).map(x => x.name);
+  } else if (i.commandName === 'trade' && f.name === 'get') {
+    const t = i.options.get('user')?.value;
+    choices = t ? Object.keys(U(t).countries) : [];
+  } else if (i.commandName === 'give' && i.memberPermissions?.has('Administrator')) {
+    choices = [...new Set([...Object.keys(u.countries), ...COUNTRIES.map(c => c.name)])];
+  } else {
+    choices = Object.keys(u.countries);
+  }
+  return i.respond(choices.filter(n => n.toLowerCase().includes(q)).slice(0, 25).map(n => ({ name: n, value: n })));
+}
+
+async function handleButton(i) {
+  const [rawKind, id] = i.customId.split(':');
+  const kind = rawKind.split('_')[0]; // 'ally_yes' -> 'ally', 'trade_no' -> 'trade', 'claim' -> 'claim'
+  if (kind === 'claim') {
+    const s = spawns.get(i.message.id);
+    if (!s) return i.reply({ content: 'These envoys already left.', ...eph });
+    if (s.claimedBy) return i.reply({ content: 'Too late, someone else got them first.', ...eph });
+    s.claimedBy = i.user.id; // synchronous = first click wins
+    const u = U(i.user.id); const name = s.country.name;
+    let note;
+    if (u.countries[name] === undefined) { u.countries[name] = 0; note = 'A new country joins your empire.'; }
+    else { u.countries[name] = Math.min(MAX_MASTERY, u.countries[name] + 5); note = 'You already had them, so they brought gifts: +5 mastery.'; }
+    save();
+    const e = EmbedBuilder.from(i.message.embeds[0]).addFields({ name: 'Claimed by', value: `<@${i.user.id}>` }).setFooter({ text: note });
+    await i.update({ embeds: [e], components: [] });
+    setTimeout(() => spawns.delete(i.message.id), 60000);
+    return;
+  }
+  if (kind === 'trade') {
+    const t = pendingTrades.get(id);
+    if (!t) return i.reply({ content: 'This offer expired.', ...eph });
+    if (i.user.id !== t.to) return i.reply({ content: 'This offer is not for you.', ...eph });
+    pendingTrades.delete(id);
+    if (i.customId.startsWith('trade_no')) return i.update({ content: `<@${t.to}> declined the trade.`, components: [] });
+    const a = U(t.from), b = U(t.to);
+    if (a.countries[t.give] === undefined || b.countries[t.get] === undefined || a.countries[t.get] !== undefined || b.countries[t.give] !== undefined)
+      return i.update({ content: 'The trade is no longer possible.', components: [] });
+    delete a.countries[t.give]; delete b.countries[t.get];
+    a.countries[t.get] = 0; b.countries[t.give] = 0; save();
+    return i.update({ content: `Trade done: <@${t.from}> gave **${t.give}** and received **${t.get}**. Mastery of both resets to 0.`, components: [] });
+  }
+  if (kind === 'ally') {
+    const t = pendingAllies.get(id);
+    if (!t) return i.reply({ content: 'This proposal expired.', ...eph });
+    if (i.user.id !== t.to) return i.reply({ content: 'This proposal is not for you.', ...eph });
+    pendingAllies.delete(id);
+    if (i.customId.startsWith('ally_no')) return i.update({ content: `<@${t.to}> refused the alliance.`, components: [] });
+    const a = U(t.from), b = U(t.to);
+    if (!a.allies.includes(t.to)) a.allies.push(t.to);
+    if (!b.allies.includes(t.from)) b.allies.push(t.from);
+    save();
+    return i.update({ content: `<@${t.from}> and <@${t.to}> are now allies.`, components: [] });
+  }
+}
+
+/* ---- /collection ---- */
+async function collection(i) {
+  const user = i.options.getUser('user') || i.user;
+  const u = U(user.id);
+  const entries = Object.entries(u.countries).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return i.reply({ content: `${user.username} has no countries yet.`, ...eph });
+  let lines = entries.map(([n, m]) => { const c = BY_NAME.get(n.toLowerCase()); return `**${n}** (${c?.rarity ?? '?'}) ${bar(m)}`; });
+  let text = lines.join('\n');
+  if (text.length > 3900) { while (lines.join('\n').length > 3850) lines.pop(); text = lines.join('\n') + `\n... and ${entries.length - lines.length} more`; }
+  const e = new EmbedBuilder().setColor(0x3498db).setTitle(`${user.username}'s collection`)
+    .setDescription(text).setFooter({ text: `${entries.length}/${COUNTRIES.length} countries - ${masteredCount(u)} mastered` });
+  return i.reply({ embeds: [e] });
+}
+
+/* ---- /leaderboard ---- */
+async function leaderboard(i) {
+  const type = i.options.getString('type') || 'mastery';
+  let rows, title;
+  if (type === 'factions') {
+    title = 'Top factions';
+    rows = Object.values(db.factions).map(f => ({ label: `**${f.name}** (${f.members.length} members)`, v: factionPower(f), unit: 'mastery' }));
+  } else {
+    const fn = { mastery: u => totalMastery(u), countries: u => Object.keys(u.countries).length, wins: u => u.wins }[type];
+    title = { mastery: 'Top total mastery', countries: 'Top collectors', wins: 'Top warlords' }[type];
+    rows = Object.entries(db.users).map(([id, u]) => ({ label: `<@${id}>`, v: fn(u), unit: type === 'wins' ? 'wins' : type === 'countries' ? 'countries' : 'mastery' }));
+  }
+  rows = rows.filter(r => r.v > 0).sort((a, b) => b.v - a.v).slice(0, 10);
+  const d = rows.length ? rows.map((r, n) => `**${n + 1}.** ${r.label} - ${r.v} ${r.unit}`).join('\n') : 'Nobody on the board yet.';
+  return i.reply({ embeds: [new EmbedBuilder().setColor(0xf1c40f).setTitle(title).setDescription(d)] });
+}
+
+/* ---- /farm ---- */
+async function farm(i) {
+  const u = U(i.user.id);
+  const left = u.lastFarm + FARM_COOLDOWN - Date.now();
+  if (left > 0) return i.reply({ content: `Your people are still working. Try again <t:${Math.ceil((Date.now() + left) / 1000)}:R>.`, ...eph });
+  const owned = Object.keys(u.countries);
+  if (!owned.length) return i.reply({ content: 'You own no country yet. Wait for the next envoys to arrive.', ...eph });
+  let name = i.options.getString('country');
+  if (name) {
+    name = owned.find(n => n.toLowerCase() === name.toLowerCase());
+    if (!name) return i.reply({ content: 'You do not own that country.', ...eph });
+  } else {
+    const open = owned.filter(n => u.countries[n] < MAX_MASTERY);
+    if (!open.length) return i.reply({ content: 'All your countries are already at max mastery.', ...eph });
+    name = pick(open);
+  }
+  if (u.countries[name] >= MAX_MASTERY) return i.reply({ content: `${name} is already at max mastery.`, ...eph });
+  const [text, bonus] = pick(FARM_EVENTS);
+  const gain = 1 + bonus;
+  u.countries[name] = Math.min(MAX_MASTERY, u.countries[name] + gain);
+  u.lastFarm = Date.now(); save();
+  const m = u.countries[name];
+  const e = new EmbedBuilder().setColor(0x57f287).setTitle(name)
+    .setDescription(`You gained **+${gain}** mastery.\n${bar(m)}\n\n${text}${bonus ? ` (+${bonus})` : ''}.${m >= MAX_MASTERY ? `\n\n**${name} is now fully mastered.**` : ''}`);
+  return i.reply({ embeds: [e] });
+}
+
+/* ---- /redeem ---- */
+async function redeem(i) {
+  const u = U(i.user.id);
+  if (!EMBED_PERMS_ROLE_ID) return i.reply({ content: 'The reward role is not configured.', ...eph });
+  const n = masteredCount(u);
+  if (n < 3) return i.reply({ content: `You need 3 countries at mastery ${MAX_MASTERY}. You have ${n}.`, ...eph });
+  const member = await i.guild.members.fetch(i.user.id);
+  if (member.roles.cache.has(EMBED_PERMS_ROLE_ID)) return i.reply({ content: 'You already have the embed perms role.', ...eph });
+  try { await member.roles.add(EMBED_PERMS_ROLE_ID); }
+  catch { return i.reply({ content: 'I could not give you the role. An admin needs to put my role above it and give me Manage Roles.', ...eph }); }
+  u.redeemed = true; save();
+  return i.reply({ content: `Congratulations <@${i.user.id}>, you earned embed links and GIF permissions.` });
+}
+
+/* ---- /war ---- */
+async function war(i) {
+  const target = i.options.getUser('target');
+  if (target.bot || target.id === i.user.id) return i.reply({ content: 'Pick another player to fight.', ...eph });
+  const a = U(i.user.id), d = U(target.id);
+  const left = a.lastWar + WAR_COOLDOWN - Date.now();
+  if (left > 0) return i.reply({ content: `Your armies are resting. Try again <t:${Math.ceil((Date.now() + left) / 1000)}:R>.`, ...eph });
+  if (a.allies.includes(target.id)) return i.reply({ content: 'You cannot attack an ally. Break the alliance first.', ...eph });
+  if (a.faction && a.faction === d.faction) return i.reply({ content: 'You cannot attack a member of your own faction.', ...eph });
+  let att;
+  const chosen = i.options.getString('country');
+  if (chosen) {
+    const n = Object.keys(a.countries).find(x => x.toLowerCase() === chosen.toLowerCase());
+    if (!n) return i.reply({ content: 'You do not own that country.', ...eph });
+    att = { c: BY_NAME.get(n.toLowerCase()), m: a.countries[n] };
+  } else att = bestWarCountry(a);
+  const def = bestWarCountry(d, true);
+  if (!att) return i.reply({ content: 'You have no country to send to war.', ...eph });
+  if (!def) return i.reply({ content: `${target.username} has no country to defend.`, ...eph });
+
+  const support = (u) => {
+    let s = 0;
+    for (const id of u.allies.slice(0, 3)) { const b = bestWarCountry(U(id)); if (b) s += 3 + b.c.allies / 10; }
+    const f = u.faction && db.factions[u.faction]; if (f) s += Math.min(10, f.members.length * 2);
+    return s;
+  };
+  const power = (x, u, defending) => x.c.war * (defending ? defMult(x.c) : 1) * (0.5 + x.m / MAX_MASTERY) + support(u) + rnd(0, 40);
+  const pa = power(att, a, false), pd = power(def, d, true);
+  a.lastWar = Date.now();
+  const won = pa > pd;
+  const [wU, wC, lU, lC] = won ? [a, att, d, def] : [d, def, a, att];
+  wU.wins++; lU.losses++;
+  wU.countries[wC.c.name] = Math.min(MAX_MASTERY, wU.countries[wC.c.name] + 3);
+  lU.countries[lC.c.name] = Math.max(0, lU.countries[lC.c.name] - 2);
+  save();
+  const e = new EmbedBuilder().setColor(won ? 0x57f287 : 0xed4245).setTitle(`War: ${att.c.name} vs ${def.c.name}`)
+    .setDescription(`<@${i.user.id}> sent **${att.c.name}** against <@${target.id}>'s **${def.c.name}**.\n\n` +
+      `Attacker strength: **${pa.toFixed(0)}** - Defender strength: **${pd.toFixed(0)}**\n\n` +
+      `**${wC.c.name}** wins and gains +3 mastery. **${lC.c.name}** loses 2 mastery.`);
+  return i.reply({ embeds: [e] });
+}
+
+/* ---- /allies ---- */
+async function allies(i) {
+  const sub = i.options.getSubcommand(); const u = U(i.user.id);
+  if (sub === 'list') {
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Your allies')
+      .setDescription(u.allies.length ? u.allies.map(id => `<@${id}>`).join('\n') : 'You have no allies yet.')] });
+  }
+  const user = i.options.getUser('user');
+  if (user.bot || user.id === i.user.id) return i.reply({ content: 'Pick another player.', ...eph });
+  if (sub === 'break') {
+    if (!u.allies.includes(user.id)) return i.reply({ content: 'You are not allied with that player.', ...eph });
+    u.allies = u.allies.filter(x => x !== user.id); U(user.id).allies = U(user.id).allies.filter(x => x !== i.user.id); save();
+    return i.reply({ content: `The alliance between <@${i.user.id}> and <@${user.id}> is over.` });
+  }
+  if (u.allies.includes(user.id)) return i.reply({ content: 'You are already allies.', ...eph });
+  if (u.allies.length >= 5) return i.reply({ content: 'You can have at most 5 allies.', ...eph });
+  const id = nid(); pendingAllies.set(id, { from: i.user.id, to: user.id }); setTimeout(() => pendingAllies.delete(id), 5 * 60 * 1000);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ally_yes:${id}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`ally_no:${id}`).setLabel('Decline').setStyle(ButtonStyle.Danger));
+  return i.reply({ content: `<@${user.id}>, <@${i.user.id}> proposes an alliance. Allies support each other in wars.`, components: [row] });
+}
+
+/* ---- /faction ---- */
+async function faction(i) {
+  const sub = i.options.getSubcommand(); const u = U(i.user.id);
+  const mine = u.faction && db.factions[u.faction];
+  if (sub === 'create') {
+    const name = i.options.getString('name').trim(); const key = factionKey(name);
+    if (u.faction) return i.reply({ content: 'Leave your current faction first.', ...eph });
+    if (db.factions[key]) return i.reply({ content: 'That faction name is taken.', ...eph });
+    db.factions[key] = { name, leader: i.user.id, members: [i.user.id], created: Date.now() }; u.faction = key; save();
+    return i.reply({ content: `The faction **${name}** has been founded by <@${i.user.id}>.` });
+  }
+  if (sub === 'join') {
+    const key = factionKey(i.options.getString('name')); const f = db.factions[key];
+    if (!f) return i.reply({ content: 'No faction with that name.', ...eph });
+    if (u.faction) return i.reply({ content: 'Leave your current faction first.', ...eph });
+    if (f.members.length >= 25) return i.reply({ content: 'That faction is full (25 members).', ...eph });
+    f.members.push(i.user.id); u.faction = key; save();
+    return i.reply({ content: `<@${i.user.id}> joined **${f.name}**.` });
+  }
+  if (sub === 'leave') {
+    if (!mine) return i.reply({ content: 'You are not in a faction.', ...eph });
+    mine.members = mine.members.filter(x => x !== i.user.id); u.faction = null;
+    if (!mine.members.length) delete db.factions[factionKey(mine.name)];
+    else if (mine.leader === i.user.id) mine.leader = mine.members[0];
+    save();
+    return i.reply({ content: `You left **${mine.name}**.` });
+  }
+  if (sub === 'disband') {
+    if (!mine || mine.leader !== i.user.id) return i.reply({ content: 'Only a faction leader can do that.', ...eph });
+    for (const id of mine.members) U(id).faction = null;
+    delete db.factions[factionKey(mine.name)]; save();
+    return i.reply({ content: `The faction **${mine.name}** has been disbanded.` });
+  }
+  if (sub === 'list') {
+    const list = Object.values(db.factions).sort((a, b) => factionPower(b) - factionPower(a)).slice(0, 20);
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x9b59b6).setTitle('Factions')
+      .setDescription(list.length ? list.map(f => `**${f.name}** - ${f.members.length} members - ${factionPower(f)} mastery`).join('\n') : 'No faction yet. Use /faction create.')] });
+  }
+  if (sub === 'info') {
+    const n = i.options.getString('name'); const f = n ? db.factions[factionKey(n)] : mine;
+    if (!f) return i.reply({ content: 'Faction not found.', ...eph });
+    return i.reply({ embeds: [new EmbedBuilder().setColor(0x9b59b6).setTitle(f.name)
+      .addFields({ name: 'Leader', value: `<@${f.leader}>`, inline: true }, { name: 'Power', value: `${factionPower(f)} mastery`, inline: true },
+        { name: `Members (${f.members.length})`, value: f.members.map(id => `<@${id}>`).join(', ').slice(0, 1000) })
+      .setFooter({ text: `War bonus for members: +${Math.min(10, f.members.length * 2)}` })] });
+  }
+}
+
+/* ---- /profile ---- */
+async function profile(i) {
+  const user = i.options.getUser('user') || i.user; const u = U(user.id);
+  const best = bestWarCountry(u); const f = u.faction && db.factions[u.faction];
+  const e = new EmbedBuilder().setColor(0x3498db).setTitle(`${user.username}'s empire`)
+    .addFields(
+      { name: 'Countries', value: `${Object.keys(u.countries).length}/${COUNTRIES.length}`, inline: true },
+      { name: 'Mastered', value: `${masteredCount(u)}`, inline: true },
+      { name: 'Total mastery', value: `${totalMastery(u)}`, inline: true },
+      { name: 'Wars', value: `${u.wins}W - ${u.losses}L`, inline: true },
+      { name: 'Faction', value: f ? f.name : 'None', inline: true },
+      { name: 'Allies', value: `${u.allies.length}`, inline: true },
+      { name: 'Strongest army', value: best ? `${best.c.name} (mastery ${best.m})` : 'None' },
+      { name: 'Embed perms', value: u.redeemed ? 'Redeemed' : `${masteredCount(u)}/3 mastered countries`, inline: true });
+  return i.reply({ embeds: [e] });
+}
+
+/* ---- /trade ---- */
+async function trade(i) {
+  const other = i.options.getUser('user'); const give = i.options.getString('give'); const get = i.options.getString('get');
+  if (other.bot || other.id === i.user.id) return i.reply({ content: 'Pick another player.', ...eph });
+  const a = U(i.user.id), b = U(other.id);
+  const g = Object.keys(a.countries).find(n => n.toLowerCase() === give.toLowerCase());
+  const w = Object.keys(b.countries).find(n => n.toLowerCase() === get.toLowerCase());
+  if (!g) return i.reply({ content: 'You do not own the country you offer.', ...eph });
+  if (!w) return i.reply({ content: `${other.username} does not own that country.`, ...eph });
+  if (a.countries[w] !== undefined || b.countries[g] !== undefined) return i.reply({ content: 'One of you already owns the country you would receive.', ...eph });
+  const id = nid(); pendingTrades.set(id, { from: i.user.id, to: other.id, give: g, get: w }); setTimeout(() => pendingTrades.delete(id), 5 * 60 * 1000);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`trade_yes:${id}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`trade_no:${id}`).setLabel('Decline').setStyle(ButtonStyle.Danger));
+  return i.reply({ content: `<@${other.id}>, <@${i.user.id}> offers **${g}** in exchange for your **${w}**. Mastery resets to 0 on both sides.`, components: [row] });
+}
+
+/* ---- /daily ---- */
+async function daily(i) {
+  const u = U(i.user.id);
+  const left = u.lastDaily + DAILY_COOLDOWN - Date.now();
+  if (left > 0) return i.reply({ content: `The tribute is not ready. Come back <t:${Math.ceil((Date.now() + left) / 1000)}:R>.`, ...eph });
+  const open = Object.keys(u.countries).filter(n => u.countries[n] < MAX_MASTERY);
+  if (!open.length) return i.reply({ content: 'You have no country that can still gain mastery.', ...eph });
+  const name = pick(open);
+  u.countries[name] = Math.min(MAX_MASTERY, u.countries[name] + 5); u.lastDaily = Date.now(); save();
+  return i.reply({ embeds: [new EmbedBuilder().setColor(0xf1c40f).setTitle(name)
+    .setDescription(`The crown sent its yearly tribute.\nYou gained **+5** mastery.\n${bar(u.countries[name])}`)] });
+}
+
+/* ---- /backup ---- */
+async function backup(i) {
+  if (!i.memberPermissions?.has('Administrator')) return i.reply({ content: 'Admins only.', ...eph });
+  await i.deferReply(eph);
+  const ok = await doBackup(true);
+  return i.editReply(ok ? 'Backup sent to the backup channel.' : 'Backup failed, check the logs.');
+}
+
+/* ---- /give ---- */
+async function give(i) {
+  const to = i.options.getUser('to'); const input = i.options.getString('country');
+  if (to.bot) return i.reply({ content: 'Bots do not need countries.', ...eph });
+  const real = BY_NAME.get(input.toLowerCase());
+  if (!real) return i.reply({ content: 'Unknown country.', ...eph });
+  const name = real.name;
+  const giver = U(i.user.id), receiver = U(to.id);
+  if (receiver.countries[name] !== undefined) return i.reply({ content: `${to.username} already owns ${name}.`, ...eph });
+  const owns = giver.countries[name] !== undefined;
+  const isAdmin = i.memberPermissions?.has('Administrator');
+  if (!owns && !isAdmin) return i.reply({ content: 'You do not own that country.', ...eph });
+  if (to.id === i.user.id) return i.reply({ content: 'You cannot give a country to yourself.', ...eph });
+  if (owns) delete giver.countries[name];
+  receiver.countries[name] = 0; save();
+  const e = new EmbedBuilder().setColor(0x57f287).setTitle(name)
+    .setDescription(owns
+      ? `<@${i.user.id}> gave **${name}** to <@${to.id}>.\nMastery resets to 0.`
+      : `<@${i.user.id}> granted **${name}** to <@${to.id}>.`);
+  return i.reply({ embeds: [e] });
+}
+
+/* ------------------------------ HOST: DROPS & MINIGAMES ------------------------------ */
+let game = null;            // the running minigame, if any
+const forcedQueue = [];     // countries the host queued for the next automatic drops
+
+function grantCountry(userId, name) {
+  const u = U(userId);
+  if (u.countries[name] === undefined) { u.countries[name] = 0; return 'A new country joins your empire.'; }
+  u.countries[name] = Math.min(MAX_MASTERY, u.countries[name] + 5);
+  return 'You already had them, so they brought gifts: +5 mastery.';
+}
+const norm = (s) => s.toLowerCase().trim().replace(/\s+/g, ' ');
+
+// The host always owns every country at max mastery (re-applied at startup and every minute)
+function ensureHostMax() {
+  const u = U(HOST_ID); let changed = false;
+  for (const c of COUNTRIES) if (u.countries[c.name] !== MAX_MASTERY) { u.countries[c.name] = MAX_MASTERY; changed = true; }
+  if (changed) save();
+}
+
+async function startGame(g, embed) {
+  const channel = await client.channels.fetch(COUNTRY_CHANNEL_ID);
+  const mine = game = { ...g, last: new Map() };
+  mine.timer = setTimeout(() => {
+    if (game !== mine) return;
+    game = null;
+    const reveal = mine.type === 'guess' ? `The number was **${mine.answer}**.` : `The answer was **${mine.display}**.`;
+    channel.send({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('Time is up!')
+      .setDescription(`${reveal}\nNobody won **${mine.country.name}**.`)] }).catch(() => {});
+  }, GAME_MS);
+  try { await channel.send({ embeds: [embed] }); }
+  catch (e) { clearTimeout(mine.timer); if (game === mine) game = null; throw e; }
+}
+
+async function hostCmd(i) {
+  if (i.user.id !== HOST_ID) return i.reply({ content: 'Only the host can use this command.', ...eph });
+  const sub = i.options.getSubcommand();
+
+  if (sub === 'stop') {
+    if (!game) return i.reply({ content: 'No game is running.', ...eph });
+    clearTimeout(game.timer); game = null;
+    return i.reply({ content: 'The game was cancelled.', ...eph });
+  }
+
+  const cName = i.options.getString('country');
+  const c = BY_NAME.get((cName || '').toLowerCase());
+  if (!c) return i.reply({ content: 'Unknown country. Pick one from the list.', ...eph });
+
+  if (sub === 'now') {
+    await i.deferReply(eph);
+    await spawnCountry(c);
+    return i.editReply(`**${c.name}** was dropped in the country channel.`);
+  }
+  if (sub === 'next') {
+    forcedQueue.push(c);
+    return i.reply({ content: `**${c.name}** will be the next automatic drop. Queue: ${forcedQueue.map(x => x.name).join(', ')}.`, ...eph });
+  }
+
+  // minigames
+  if (game) return i.reply({ content: 'A game is already running. Wait for it to end or use /host stop.', ...eph });
+  await i.deferReply(eph);
+  const prize = `**${c.name}** (${c.rarity})`;
+
+  if (sub === 'guess') {
+    const number = i.options.getInteger('number'); const max = i.options.getInteger('max') ?? 100;
+    if (number > max) return i.editReply(`The number must be between 1 and ${max}.`);
+    await startGame({ type: 'guess', answer: number, max, country: c },
+      new EmbedBuilder().setColor(RARITY_COLOR[c.rarity]).setTitle('Number guessing game!')
+        .setDescription(`I am thinking of a number between **1** and **${max}**.\nUse **/guess** to try. You get a hint after each guess.\n\nPrize: ${prize}\nYou have **60 seconds**.`));
+    return i.editReply(`Game started. Secret number: **${number}**. Prize: ${prize}.`);
+  }
+  if (sub === 'quiz') {
+    const q = i.options.getString('question'); const a = i.options.getString('answer');
+    await startGame({ type: 'quiz', answer: norm(a), display: a, country: c },
+      new EmbedBuilder().setColor(RARITY_COLOR[c.rarity]).setTitle('Question game!')
+        .setDescription(`**${q}**\n\nUse **/answer** to reply.\nPrize: ${prize}\nYou have **60 seconds**.`));
+    return i.editReply(`Game started. Answer: **${a}**. Prize: ${prize}.`);
+  }
+}
+
+async function winGame(i) {
+  const g = game; game = null; clearTimeout(g.timer);
+  const note = grantCountry(i.user.id, g.country.name); save();
+  const reveal = g.type === 'guess' ? `The number was **${g.answer}**.` : `The answer was **${g.display}**.`;
+  return i.reply({ embeds: [new EmbedBuilder().setColor(0x57f287).setTitle('We have a winner!')
+    .setDescription(`<@${i.user.id}> won **${g.country.name}**!\n${reveal}\n${note}`)] });
+}
+function gameGate(i, type) {
+  if (!game || game.type !== type) return i.reply({ content: `No ${type === 'guess' ? 'number' : 'question'} game is running right now.`, ...eph });
+  if (i.user.id === HOST_ID) return i.reply({ content: 'You are the host, you cannot play.', ...eph });
+  const last = game.last.get(i.user.id) || 0;
+  if (Date.now() - last < 2000) return i.reply({ content: 'Slow down a little.', ...eph });
+  game.last.set(i.user.id, Date.now());
+  return null;
+}
+async function guessCmd(i) {
+  const blocked = gameGate(i, 'guess'); if (blocked) return blocked;
+  const n = i.options.getInteger('number');
+  if (n < 1 || n > game.max) return i.reply({ content: `Pick a number between 1 and ${game.max}.`, ...eph });
+  if (n === game.answer) return winGame(i);
+  return i.reply({ content: n < game.answer ? `${n} is too low.` : `${n} is too high.`, ...eph });
+}
+async function answerCmd(i) {
+  const blocked = gameGate(i, 'quiz'); if (blocked) return blocked;
+  if (norm(i.options.getString('text')) === game.answer) return winGame(i);
+  return i.reply({ content: 'Not quite, try again.', ...eph });
+}
+
+/* ------------------------------ READY ------------------------------ */
+client.once(Events.ClientReady, async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await restoreBackup();
+  ensureHostMax();
+  try { const g = await client.guilds.fetch(GUILD_ID); await g.commands.set(commands); console.log('Slash commands registered.'); }
+  catch (e) { console.error('Command registration failed:', e.message); }
+  setInterval(() => doBackup(), BACKUP_MS);
+  setInterval(ensureHostMax, 60 * 1000);
+  setTimeout(spawnCountry, 10000);
+  setInterval(spawnCountry, SPAWN_MS);
+});
+
+process.on('unhandledRejection', (e) => console.error('Unhandled:', e));
+process.on('SIGTERM', async () => {
+  try { await Promise.race([doBackup(), new Promise(r => setTimeout(r, 5000))]); } catch {}
+  process.exit(0);
+});
+
+// Tiny web server so Render keeps the service alive
+http.createServer((_, res) => { res.writeHead(200); res.end('Bot is running'); }).listen(process.env.PORT || 3000);
+
+// Extra keep-alive ping (Render sets RENDER_EXTERNAL_URL). An external pinger like UptimeRobot is still recommended.
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL).catch(() => {}); }, 4 * 60 * 1000);
+}
+
+client.on(Events.Error, (e) => console.error('Client error:', e.message));
+client.on(Events.ShardError, (e) => console.error('Shard error:', e.message));
+client.on(Events.ShardDisconnect, (ev) => console.warn('Shard disconnected, code', ev.code));
+client.on(Events.Warn, (m) => console.warn('Warn:', m));
+setTimeout(() => { if (!client.isReady()) console.error('Still not connected to Discord after 60s.'); }, 60000);
+
+// Diagnostics: shows whether Discord is reachable from this server
+client.on(Events.Debug, (m) => { if (!/token/i.test(m)) console.log('[debug]', m.slice(0, 200)); });
+fetch('https://discord.com/api/v10/gateway')
+  .then(r => console.log('Discord API check: HTTP', r.status, r.status === 429 ? '(this server IP is rate-limited by Discord)' : ''))
+  .catch(e => console.error('Discord API unreachable:', e.message));
+
+console.log('Connecting to Discord...');
+client.login(TOKEN).catch((e) => { console.error('Startup failed:', e.message); process.exit(1); });
